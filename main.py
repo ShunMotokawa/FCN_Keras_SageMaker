@@ -10,10 +10,20 @@ from tensorflow.python.keras.models import Sequential
 from tensorflow.python.keras.optimizers import RMSprop
 from tensorflow.python.saved_model.signature_constants import PREDICT_INPUTS
 
-HEIGHT = 32
-WIDTH = 32
+from environment import create_trainer_environment
+from keras import optimizers
+from keras.models import *
+import keras.backend as K
+
+from utils.resnet_helpers import *
+if K.backend() == 'tensorflow':
+    from utils.BilinearUpSampling import *
+from utils.SegDataGenerator import *
+
+HEIGHT = 224
+WIDTH = 224
 DEPTH = 3
-NUM_CLASSES = 10
+NUM_CLASSES = 22
 NUM_DATA_BATCHES = 5
 NUM_EXAMPLES_PER_EPOCH_FOR_TRAIN = 10000 * NUM_DATA_BATCHES
 BATCH_SIZE = 128
@@ -29,39 +39,73 @@ def keras_model_fn(hyperparameters):
                          training script.
     Returns: A compiled Keras model
     """
-    model = Sequential()
+    # the trainer environment contains useful information about
+    env = create_trainer_environment()
+    print('creating SageMaker trainer environment:\n%s' % str(env))
 
-    # TensorFlow Serving default prediction input tensor name is PREDICT_INPUTS.
-    # We must conform to this naming scheme.
-    model.add(InputLayer(input_shape=(HEIGHT, WIDTH, DEPTH), name=PREDICT_INPUTS))
-    model.add(Conv2D(32, (3, 3), padding='same'))
-    model.add(Activation('relu'))
-    model.add(Conv2D(32, (3, 3)))
-    model.add(Activation('relu'))
-    model.add(MaxPooling2D(pool_size=(2, 2)))
-    model.add(Dropout(0.25))
+    # getting the hyperparameters
+    batch_size = env.hyperparameters.get('batch_size', object_type=int)
+    data_augmentation = env.hyperparameters.get('data_augmentation', default=True, object_type=bool)
+    learning_rate = env.hyperparameters.get('learning_rate', default=.0001, object_type=float)
+    width_shift_range = env.hyperparameters.get('width_shift_range', object_type=float)
+    height_shift_range = env.hyperparameters.get('height_shift_range', object_type=float)
+    EPOCHS = env.hyperparameters.get('epochs', default=10, object_type=int)
 
-    model.add(Conv2D(64, (3, 3), padding='same'))
-    model.add(Activation('relu'))
-    model.add(Conv2D(64, (3, 3)))
-    model.add(Activation('relu'))
-    model.add(MaxPooling2D(pool_size=(2, 2)))
-    model.add(Dropout(0.25))
+    weight_decay = 0.
+    batch_momentum = 0.9
+    batch_shape = x_train.shape
+    classes = 22
+    img_input = Input(batch_shape=batch_shape)
+    image_size = batch_shape[2:4]
+    print('batch_shape' + str(batch_shape))
+    print('image_size' + str(image_size))
+    bn_axis = 1  # TODO(Shun): Check '3' is ok or not. Documentation recommends '1'
 
-    model.add(Flatten())
-    model.add(Dense(512))
-    model.add(Activation('relu'))
-    model.add(Dropout(0.5))
-    model.add(Dense(NUM_CLASSES))
-    model.add(Activation('softmax'))
+    x = Conv2D(64, (7, 7), strides=(2, 2), padding='same', name='conv1', kernel_regularizer=l2(weight_decay))(img_input)
+    x = BatchNormalization(axis=bn_axis, name='bn_conv1', momentum=batch_momentum)(x)
+    x = Activation('relu')(x)
+    # x = MaxPooling2D((3, 3), strides=(2, 2))(x)
+    x = MaxPooling2D((2, 2), strides=(2, 2))(x)  # TODO(Shun): (2, 2) is just random. Further consideration needed
 
-    _model = tf.keras.Model(inputs=model.input, outputs=model.output)
+    x = conv_block(3, [64, 64, 256], stage=2, block='a', weight_decay=weight_decay, strides=(1, 1), batch_momentum=batch_momentum)(x)
+    x = identity_block(3, [64, 64, 256], stage=2, block='b', weight_decay=weight_decay, batch_momentum=batch_momentum)(x)
+    x = identity_block(3, [64, 64, 256], stage=2, block='c', weight_decay=weight_decay, batch_momentum=batch_momentum)(x)
 
-    opt = RMSprop(lr=hyperparameters['learning_rate'], decay=hyperparameters['decay'])
+    x = conv_block(3, [128, 128, 512], stage=3, block='a', weight_decay=weight_decay, batch_momentum=batch_momentum)(x)
+    x = identity_block(3, [128, 128, 512], stage=3, block='b', weight_decay=weight_decay, batch_momentum=batch_momentum)(x)
+    x = identity_block(3, [128, 128, 512], stage=3, block='c', weight_decay=weight_decay, batch_momentum=batch_momentum)(x)
+    x = identity_block(3, [128, 128, 512], stage=3, block='d', weight_decay=weight_decay, batch_momentum=batch_momentum)(x)
 
-    _model.compile(loss='categorical_crossentropy',
-                   optimizer=opt,
-                   metrics=['accuracy'])
+    x = conv_block(3, [256, 256, 1024], stage=4, block='a', weight_decay=weight_decay, batch_momentum=batch_momentum)(x)
+    x = identity_block(3, [256, 256, 1024], stage=4, block='b', weight_decay=weight_decay, batch_momentum=batch_momentum)(x)
+    x = identity_block(3, [256, 256, 1024], stage=4, block='c', weight_decay=weight_decay, batch_momentum=batch_momentum)(x)
+    x = identity_block(3, [256, 256, 1024], stage=4, block='d', weight_decay=weight_decay, batch_momentum=batch_momentum)(x)
+    x = identity_block(3, [256, 256, 1024], stage=4, block='e', weight_decay=weight_decay, batch_momentum=batch_momentum)(x)
+    x = identity_block(3, [256, 256, 1024], stage=4, block='f', weight_decay=weight_decay, batch_momentum=batch_momentum)(x)
+
+    x = atrous_conv_block(3, [512, 512, 2048], stage=5, block='a', weight_decay=weight_decay, atrous_rate=(2, 2), batch_momentum=batch_momentum)(x)
+    x = atrous_identity_block(3, [512, 512, 2048], stage=5, block='b', weight_decay=weight_decay, atrous_rate=(2, 2), batch_momentum=batch_momentum)(x)
+    x = atrous_identity_block(3, [512, 512, 2048], stage=5, block='c', weight_decay=weight_decay, atrous_rate=(2, 2), batch_momentum=batch_momentum)(x)
+    # classifying layer
+    # x = Conv2D(classes, (3, 3), dilation_rate=(2, 2), kernel_initializer='normal', activation='linear', padding='same', strides=(1, 1), kernel_regularizer=l2(weight_decay))(x)
+    x = Conv2D(classes, (1, 1), kernel_initializer='he_normal', activation='linear', padding='same', strides=(1, 1), kernel_regularizer=l2(weight_decay))(x)
+
+    # TODO(Warning): UpSampling2D of Keras cannot accurately represent BilinearUpSampling2D of Tensorflow
+    if K.backend() == 'tensorflow':
+        x = BilinearUpSampling2D(target_size=tuple(image_size))(x)
+    elif K.backend() == 'mxnet':
+        # TODO(Warning): This method works only when the input image size is 224 * 224
+        x = UpSampling2D(size=(16, 16), data_format=None)(x)
+        # x = K.symbol.UpSampling(x, (image_size[0], image_size[1]), sample_type='bilinear')
+    # x = K.resize_images(x, image_size[0], image_size[1], 'channels_first')
+
+    _model = Model(img_input, x)
+
+    # initiate RMSprop optimizer
+    opt = optimizers.rmsprop(lr=learning_rate, decay=1e-6)
+
+    # Let's train the model using RMSprop
+    _model.compile(loss='categorical_crossentropy', optimizer=opt, metrics=['accuracy'])
 
     return _model
 
@@ -185,17 +229,14 @@ def _record_dataset(filenames):
 
 def _filenames(mode, data_dir):
     """Returns a list of filenames based on 'mode'."""
-    data_dir = os.path.join(data_dir, 'cifar-10-batches-bin')
+    data_dir = os.path.join(data_dir, 'FileLists')
 
-    assert os.path.exists(data_dir), ('Run cifar10_download_and_extract.py first '
-                                      'to download and extract the CIFAR-10 data.')
+    assert os.path.exists(data_dir), '"FileLists" directory does not exist.'
 
     if mode == tf.estimator.ModeKeys.TRAIN:
-        return [
-            os.path.join(data_dir, 'data_batch_%d.bin' % i)
-            for i in range(1, NUM_DATA_BATCHES + 1)
-        ]
+        return os.path.join(data_dir, 'train.txt')
+
     elif mode == tf.estimator.ModeKeys.EVAL:
-        return [os.path.join(data_dir, 'test_batch.bin')]
+        return os.path.join(data_dir, 'val.txt')
     else:
         raise ValueError('Invalid mode: %s' % mode)
